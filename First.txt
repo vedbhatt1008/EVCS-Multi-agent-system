@@ -1,0 +1,1010 @@
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; DECENTRALIZED MULTI-AGENT EV CHARGING SYSTEM
+;; NetLogo Web compatible version
+;;
+;; IMPORTANT:
+;; This version does NOT require Interface sliders.
+;; All parameters are declared as globals with default values.
+;; You can later replace them with Interface sliders if desired.
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+breed [evs ev]
+breed [chargers charger]
+breed [stations station]
+breed [grid-agents grid-agent]
+
+patches-own [
+  road?
+]
+
+evs-own [
+  battery-capacity
+  battery-level
+  target-energy
+  energy-needed
+
+  arrival-time
+  departure-time
+
+  charging?
+  charging-mode
+  assigned-charger
+
+  urgency
+  waiting-time
+  priority-score
+
+  energy-price
+  money-spent
+
+  ev-state
+
+  total-energy-received
+  charging-start-time
+  completed?
+  left-without-target?
+]
+
+chargers-own [
+  occupied?
+  occupied-by
+  charger-mode
+  maximum-power
+]
+
+stations-own [
+  station-policy
+  congested?
+  station-threshold
+  number-of-chargers
+
+  total-fast-charges
+  total-slow-charges
+  total-rejected
+]
+
+grid-agents-own [
+  grid-capacity
+  current-load
+  base-load
+  peak-load
+  congestion-threshold
+  congested?
+
+  congestion-events
+  total-congestion-time
+]
+
+globals [
+  ;; ------------------------------------------------------------
+  ;; USER PARAMETERS
+  ;; Change these values to experiment with the model.
+  ;; ------------------------------------------------------------
+
+  number-of-evs
+  number-of-charging-points
+
+  grid-capacity-setting
+  base-grid-load
+  congestion-threshold-setting
+
+  fast-charging-power
+  slow-charging-power
+
+  min-battery-capacity
+  max-battery-capacity
+
+  min-initial-battery
+  max-initial-battery
+
+  min-target-energy
+  max-target-energy
+
+  arrival-time-window
+  min-time-before-departure
+  max-additional-stay-time
+
+  waiting-priority-weight
+  urgency-threshold
+
+  fast-price
+  slow-price
+
+  charging-time-scale
+  simulation-duration
+
+  allow-urgent-fast?
+
+  ;; ------------------------------------------------------------
+  ;; STATISTICS
+  ;; ------------------------------------------------------------
+
+  current-grid-load
+  peak-grid-load
+  grid-utilization
+
+  total-energy-delivered
+  total-money-spent
+
+  completed-evs
+  failed-evs
+
+  average-waiting-time
+  average-charging-time
+
+  congestion-now?
+  congestion-count
+
+  fast-charging-count
+  slow-charging-count
+
+  simulation-time
+]
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; SETUP
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to setup
+  clear-all
+
+  ;; Default parameters
+  set-default-parameters
+
+  setup-environment
+  setup-grid
+  setup-station
+  setup-chargers
+  setup-evs
+  reset-statistics
+
+  reset-ticks
+  update-statistics
+  update-visuals
+end
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; DEFAULT PARAMETERS
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to set-default-parameters
+
+  ;; EVs and chargers
+  set number-of-evs 20
+  set number-of-charging-points 10
+
+  ;; Grid
+  set grid-capacity-setting 100
+  set base-grid-load 40
+  set congestion-threshold-setting 80
+
+  ;; Charging power
+  set fast-charging-power 20
+  set slow-charging-power 8
+
+  ;; Battery
+  set min-battery-capacity 50
+  set max-battery-capacity 100
+
+  set min-initial-battery 10
+  set max-initial-battery 50
+
+  set min-target-energy 60
+  set max-target-energy 90
+
+  ;; Time
+  set arrival-time-window 20
+  set min-time-before-departure 30
+  set max-additional-stay-time 50
+
+  ;; Priority
+  set waiting-priority-weight 0.05
+  set urgency-threshold 1.0
+
+  ;; Prices
+  set fast-price 0.40
+  set slow-price 0.25
+
+  ;; Simulation
+  set charging-time-scale 0.10
+  set simulation-duration 200
+
+  ;; Policy
+  set allow-urgent-fast? true
+end
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; ENVIRONMENT
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to setup-environment
+
+  ask patches [
+    set road? false
+    set pcolor 9
+  ]
+
+  ;; Horizontal road
+  ask patches with [abs pycor <= 2] [
+    set road? true
+    set pcolor 7
+  ]
+
+  ;; Vertical road
+  ask patches with [abs pxcor <= 2] [
+    set road? true
+    set pcolor 7
+  ]
+
+end
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; GRID AGENT
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to setup-grid
+
+  create-grid-agents 1 [
+
+    setxy (min-pxcor + 2) (max-pycor - 2)
+
+    set shape "power"
+    set color yellow
+    set size 2
+
+    set grid-capacity grid-capacity-setting
+    set base-load base-grid-load
+    set congestion-threshold congestion-threshold-setting
+
+    set current-load base-load
+    set peak-load base-load
+
+    set congestion-events 0
+    set total-congestion-time 0
+
+    set congested? false
+  ]
+
+end
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; STATION
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to setup-station
+
+  create-stations 1 [
+
+    setxy 7 7
+
+    set shape "house"
+    set color blue
+    set size 3
+
+    set station-policy "NORMAL"
+    set congested? false
+
+    set station-threshold congestion-threshold-setting
+    set number-of-chargers number-of-charging-points
+
+    set total-fast-charges 0
+    set total-slow-charges 0
+    set total-rejected 0
+  ]
+
+end
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; CHARGERS
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to setup-chargers
+
+  let positions [
+    [4 5] [6 5] [8 5] [10 5] [12 5]
+    [4 9] [6 9] [8 9] [10 9] [12 9]
+    [4 7] [10 7] [12 7] [4 11] [10 11]
+  ]
+
+  ;; NetLogo Web cannot create more positions than are listed.
+  let n min (list number-of-charging-points length positions)
+
+  foreach (sublist positions 0 n) [ pos ->
+
+    create-chargers 1 [
+
+      setxy (item 0 pos) (item 1 pos)
+
+      set shape "circle"
+      set size 1.5
+
+      set occupied? false
+      set occupied-by nobody
+
+      set charger-mode "AVAILABLE"
+      set maximum-power fast-charging-power
+
+      set color green
+    ]
+  ]
+
+end
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; EV SETUP
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to setup-evs
+
+  create-evs number-of-evs [
+
+    move-to one-of patches with [road?]
+
+    set shape "car"
+    set size 1.3
+    set color white
+
+    set battery-capacity
+      min-battery-capacity +
+      random-float (max-battery-capacity - min-battery-capacity)
+
+    set battery-level
+      min-initial-battery +
+      random-float (max-initial-battery - min-initial-battery)
+
+    set target-energy
+      min-target-energy +
+      random-float (max-target-energy - min-target-energy)
+
+    if target-energy > battery-capacity [
+      set target-energy battery-capacity
+    ]
+
+    if battery-level > target-energy [
+      set battery-level target-energy
+    ]
+
+    set energy-needed
+      max (list 0 (target-energy - battery-level))
+
+    set arrival-time random-float arrival-time-window
+
+    set departure-time
+      arrival-time +
+      min-time-before-departure +
+      random-float max-additional-stay-time
+
+    set charging? false
+    set charging-mode "NONE"
+    set assigned-charger nobody
+
+    set urgency 0
+    set waiting-time 0
+    set priority-score 0
+
+    set energy-price 0
+    set money-spent 0
+
+    set ev-state "APPROACHING"
+
+    set total-energy-received 0
+    set charging-start-time -1
+
+    set completed? false
+    set left-without-target? false
+  ]
+
+end
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; RESET STATISTICS
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to reset-statistics
+
+  set current-grid-load 0
+  set peak-grid-load 0
+  set grid-utilization 0
+
+  set total-energy-delivered 0
+  set total-money-spent 0
+
+  set completed-evs 0
+  set failed-evs 0
+
+  set average-waiting-time 0
+  set average-charging-time 0
+
+  set congestion-now? false
+  set congestion-count 0
+
+  set fast-charging-count 0
+  set slow-charging-count 0
+
+  set simulation-time 0
+
+end
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; MAIN LOOP
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to go
+
+  if ticks >= simulation-duration [
+    stop
+  ]
+
+  update-ev-states
+  calculate-ev-urgency
+  update-grid
+  station-update-policy
+  station-allocate-charging
+  charge-evs
+  handle-departures
+  update-statistics
+  update-visuals
+
+  tick
+
+end
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; EV STATES
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to update-ev-states
+
+  ask evs [
+
+    if ev-state = "APPROACHING" and ticks >= arrival-time [
+      set ev-state "WAITING"
+    ]
+  ]
+
+end
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; URGENCY
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to calculate-ev-urgency
+
+  ask evs with [
+    ev-state = "WAITING" or ev-state = "CHARGING"
+  ] [
+
+    let time-left departure-time - ticks
+
+    if time-left <= 0 [
+      set time-left 0.1
+    ]
+
+    set energy-needed
+      max (list 0 (target-energy - battery-level))
+
+    set urgency energy-needed / time-left
+
+    set priority-score
+      urgency + (waiting-time * waiting-priority-weight)
+  ]
+
+end
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; GRID UPDATE
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to update-grid
+
+  ask grid-agents [
+
+    ;; FIX:
+    ;; The original code referred to [charging-power],
+    ;; but charging-power was never defined.
+    ;; Here power is calculated from each EV's charging mode.
+
+    let ev-load sum [
+      ifelse-value
+        (charging-mode = "FAST")
+        [fast-charging-power]
+        [slow-charging-power]
+    ] of evs with [ev-state = "CHARGING"]
+
+    set current-load base-load + ev-load
+
+    set current-grid-load current-load
+
+    ifelse grid-capacity > 0
+      [ set grid-utilization (current-load / grid-capacity) * 100 ]
+      [ set grid-utilization 0 ]
+
+    if current-load > peak-load [
+      set peak-load current-load
+    ]
+
+    if current-load > peak-grid-load [
+      set peak-grid-load current-load
+    ]
+
+    let was-congested? congested?
+
+    ifelse current-load >=
+      grid-capacity * (congestion-threshold / 100)
+      [ set congested? true ]
+      [ set congested? false ]
+
+    if congested? and not was-congested? [
+      set congestion-events congestion-events + 1
+      set congestion-count congestion-count + 1
+    ]
+
+    if congested? [
+      set total-congestion-time total-congestion-time + 1
+    ]
+
+    set congestion-now? congested?
+  ]
+
+end
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; STATION POLICY
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to station-update-policy
+
+  ask stations [
+
+    let grid-state [congested?] of one-of grid-agents
+
+    set congested? grid-state
+
+    ifelse congested?
+      [ set station-policy "CONGESTED" ]
+      [ set station-policy "NORMAL" ]
+  ]
+
+end
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; CHARGING ALLOCATION
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to station-allocate-charging
+
+  ask stations [
+
+    ;; Release chargers whose EV is no longer charging
+    ask chargers with [
+      occupied? and occupied-by != nobody
+    ] [
+      if [ev-state] of occupied-by != "CHARGING" [
+        release-charger self
+      ]
+    ]
+
+    let free-chargers chargers with [not occupied?]
+
+    ;; FIX:
+    ;; sort-by works on a list, so convert the agentset using sort.
+    let waiting-evs sort-by
+      [[ev1 ev2] ->
+        [priority-score] of ev1 > [priority-score] of ev2]
+      sort (evs with [ev-state = "WAITING"])
+
+    foreach waiting-evs [ current-ev ->
+
+      if any? free-chargers [
+
+        let selected-charger
+          min-one-of free-chargers [distance current-ev]
+
+        let selected-mode
+          choose-charging-mode current-ev
+
+        ask selected-charger [
+
+          set occupied? true
+          set occupied-by current-ev
+          set charger-mode selected-mode
+
+          if selected-mode = "FAST" [
+            set maximum-power fast-charging-power
+            set color red
+          ]
+
+          if selected-mode = "SLOW" [
+            set maximum-power slow-charging-power
+            set color blue
+          ]
+        ]
+
+        ask current-ev [
+
+          set assigned-charger selected-charger
+          set charging? true
+          set ev-state "CHARGING"
+
+          set charging-mode selected-mode
+          set charging-start-time ticks
+
+          if selected-mode = "FAST" [
+            set energy-price fast-price
+            set fast-charging-count fast-charging-count + 1
+          ]
+
+          if selected-mode = "SLOW" [
+            set energy-price slow-price
+            set slow-charging-count slow-charging-count + 1
+          ]
+
+          move-to selected-charger
+        ]
+
+        set free-chargers
+          free-chargers with [self != selected-charger]
+      ]
+    ]
+  ]
+
+end
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; CHARGING MODE DECISION
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to-report choose-charging-mode [the-ev]
+
+  let station-congested? congested?
+  let ev-urgency [urgency] of the-ev
+
+  if not station-congested? [
+    report "FAST"
+  ]
+
+  ;; Congested grid:
+  ;; slow charging is the default.
+  if station-congested? [
+
+    if allow-urgent-fast? [
+      if ev-urgency >= urgency-threshold [
+        if fast-charging-can-be-supported? [
+          report "FAST"
+        ]
+      ]
+    ]
+
+    report "SLOW"
+  ]
+
+  report "SLOW"
+
+end
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; FAST CHARGING SAFETY CHECK
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to-report fast-charging-can-be-supported?
+
+  let grid one-of grid-agents
+
+  let available-capacity
+    [grid-capacity] of grid -
+    [current-load] of grid
+
+  report available-capacity >= fast-charging-power
+
+end
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; CHARGE EVS
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to charge-evs
+
+  ask evs with [ev-state = "CHARGING"] [
+
+    let power 0
+
+    if charging-mode = "FAST" [
+      set power fast-charging-power
+    ]
+
+    if charging-mode = "SLOW" [
+      set power slow-charging-power
+    ]
+
+    let energy-this-tick
+      power * charging-time-scale
+
+    if energy-this-tick > energy-needed [
+      set energy-this-tick energy-needed
+    ]
+
+    set battery-level
+      battery-level + energy-this-tick
+
+    set energy-needed
+      max (list 0 (target-energy - battery-level))
+
+    set total-energy-received
+      total-energy-received + energy-this-tick
+
+    set money-spent
+      money-spent + (energy-this-tick * energy-price)
+
+    set total-energy-delivered
+      total-energy-delivered + energy-this-tick
+
+    set total-money-spent
+      total-money-spent + (energy-this-tick * energy-price)
+
+    if battery-level >= target-energy - 0.01 [
+
+      set battery-level target-energy
+      set completed? true
+      set ev-state "COMPLETED"
+      set charging? false
+      set color green
+
+      if assigned-charger != nobody [
+        release-charger assigned-charger
+      ]
+
+      set assigned-charger nobody
+      set charging-mode "NONE"
+    ]
+  ]
+
+end
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; RELEASE CHARGER
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to release-charger [the-charger]
+
+  if the-charger != nobody [
+
+    ask the-charger [
+      set occupied? false
+      set occupied-by nobody
+      set charger-mode "AVAILABLE"
+      set maximum-power fast-charging-power
+      set color green
+    ]
+  ]
+
+end
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; DEPARTURES
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to handle-departures
+
+  ask evs [
+
+    if ticks >= departure-time and ev-state != "LEFT" [
+
+      if completed? [
+
+        set ev-state "LEFT"
+
+        if assigned-charger != nobody [
+          release-charger assigned-charger
+        ]
+
+        set assigned-charger nobody
+        set charging? false
+        set charging-mode "NONE"
+      ]
+
+      if not completed? [
+
+        set ev-state "LEFT"
+        set left-without-target? true
+
+        if assigned-charger != nobody [
+          release-charger assigned-charger
+        ]
+
+        set assigned-charger nobody
+        set charging? false
+        set charging-mode "NONE"
+
+        set color red
+      ]
+    ]
+
+    if ev-state = "WAITING" [
+      set waiting-time waiting-time + 1
+    ]
+  ]
+
+end
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; STATISTICS
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to update-statistics
+
+  set completed-evs
+    count evs with [completed?]
+
+  set failed-evs
+    count evs with [left-without-target?]
+
+  let waiting-list
+    evs with [waiting-time > 0]
+
+  ifelse any? waiting-list
+    [ set average-waiting-time mean [waiting-time] of waiting-list ]
+    [ set average-waiting-time 0 ]
+
+  let charged-list
+    evs with [
+      charging-start-time >= 0 and completed?
+    ]
+
+  ifelse any? charged-list
+    [
+      set average-charging-time
+        mean [
+          departure-time - charging-start-time
+        ] of charged-list
+    ]
+    [
+      set average-charging-time 0
+    ]
+
+  set simulation-time ticks
+
+end
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; VISUALS
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to update-visuals
+
+  ask evs [
+
+    if ev-state = "APPROACHING" [
+      set color white
+    ]
+
+    if ev-state = "WAITING" [
+      set color orange
+    ]
+
+    if ev-state = "CHARGING" [
+
+      if charging-mode = "FAST" [
+        set color red
+      ]
+
+      if charging-mode = "SLOW" [
+        set color blue
+      ]
+    ]
+
+    if ev-state = "COMPLETED" [
+      set color green
+    ]
+
+    if ev-state = "LEFT" and left-without-target? [
+      set color red
+    ]
+  ]
+
+  ask grid-agents [
+
+    if congested? [
+      set color red
+    ]
+
+    if not congested? [
+      set color yellow
+    ]
+  ]
+
+  ask stations [
+
+    if congested? [
+      set color red
+    ]
+
+    if not congested? [
+      set color blue
+    ]
+  ]
+
+end
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; REPORTERS
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to-report number-of-active-evs
+  report count evs with [ev-state != "LEFT"]
+end
+
+to-report number-of-waiting-evs
+  report count evs with [ev-state = "WAITING"]
+end
+
+to-report number-of-charging-evs
+  report count evs with [ev-state = "CHARGING"]
+end
+
+to-report number-of-fast-evs
+  report count evs with [
+    ev-state = "CHARGING" and charging-mode = "FAST"
+  ]
+end
+
+to-report number-of-slow-evs
+  report count evs with [
+    ev-state = "CHARGING" and charging-mode = "SLOW"
+  ]
+end
+
+to-report number-of-free-chargers
+  report count chargers with [not occupied?]
+end
+
+to-report percentage-completed
+
+  if count evs = 0 [
+    report 0
+  ]
+
+  report (completed-evs / count evs) * 100
+
+end
+
+to-report percentage-failed
+
+  if count evs = 0 [
+    report 0
+  ]
+
+  report (failed-evs / count evs) * 100
+
+end
+
+to-report current-cost-per-kwh
+
+  if total-energy-delivered = 0 [
+    report 0
+  ]
+
+  report total-money-spent / total-energy-delivered
+
+end
