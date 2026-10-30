@@ -1,0 +1,1930 @@
+<?xml version="1.0" encoding="utf-8"?>
+<model version="NetLogo 7.0.4" snapToGrid="true">
+  <code><![CDATA[;; ============================================================
+;; EV CHARGING - SIMULATION PROTOCOL v3 (report Sections 3, 4 and 5)
+;;
+;; Changes compared with protocol v2:
+;;   - the christensen scenario and all "-no-grid" scenarios are removed
+;;     (no ToU signal, no deferred EVs); capped-parking scenarios added
+;;   - the minimum mode duration (10 min) holds in BOTH directions
+;;   - Local Grid allocation PERSISTS: borrowed power stays with the
+;;     borrower until it returns to normal mode, then goes back to the
+;;     donors (loan ledger). One donor (largest headroom) per request.
+;;   - check-invariants runs every tick (sum of L = c-main, P_i <= L_i)
+;;   - outputs: overload demand, average charging time (from START of
+;;     charging), service rate; 5 seeds per scenario
+;;   - arrivals slider is 10-40 EVs/hour (calibration)
+;;   - bug fixes in the "Price vs R" plot
+;;
+;; Scenarios (chooser `scenario`, exactly these five):
+;;   "uncontrolled"    nearest station, charge on arrival, normal mode only,
+;;                     fixed 205 kW allocation, no pricing logic
+;;   "method1"         fast-only mode + step price + Local Grid + price-based choice
+;;   "method2"         fast-only mode + ramp price + Local Grid + price-based choice
+;;   "method1-capped"  method1 with shorter parking (uniform 60-540 min, mean 5 h)
+;;   "method2-capped"  method2 with shorter parking (uniform 60-540 min, mean 5 h)
+;;
+;; Protocol: 1-minute steps, 7 days (days 6-7 = holiday weekend),
+;; 5 seeds per scenario (run-protocol or BehaviorSpace).
+;; Overload demand event = a minute with total REQUESTED demand = c-main
+;; (report Section 5.1). Minutes with demand ABOVE c-main are counted
+;; separately (overload-above-minutes). Consecutive minutes = one episode.
+;; Service outcome = EV reaches 80% before it leaves.
+;;
+;; REPLACE the whole Code tab with this file.
+;; Widgets this code expects (names must match exactly):
+;;   Chooser : scenario  (the five names above, in this order)
+;;   Slider  : ev-arrivals-per-hour (10-40, value 18, step 2)
+;;   Plot    : "Price vs R"
+;;   Monitors: avg-time-to-charge, avg-wait, service-rate, ... (optional)
+;; If you have NOT created the plot, set price-plot-wanted? to false
+;; in set-parameters.
+;; ============================================================
+
+globals [
+  ;; parameters (set in set-parameters)
+  c-main n-slow n-fast w-slow w-fast
+  r-high r-max min-mode-duration
+  p-slow p-fast p-cap
+  p-urgent required-charge sim-length
+  min-arrivals max-arrivals
+  limit-non-lo limit-non-hi limit-urg-lo limit-urg-hi
+  parking-min capped-scale
+  station-coords surge-minutes surge-share
+  price-plot-wanted?
+  ;; runtime
+  plots-live?
+  ;; scenario flags (set from the chooser)
+  use-fast-mode? use-local-grid? use-price-selection? capped-parking? price-method
+  ;; pre-generated EV arrivals (same for every scenario with the same seed)
+  schedule sched-i surge-stations
+  ;; Local Grid loan ledger: item (borrower-id * n + donor-id) = kW borrowed
+  loan-matrix
+  ;; metrics
+  served-count unserved-count balked-count
+  wait-count wait-sum time-sum charge-time-sum
+  unserved-kwh unmet-kwh energy-delivered delivered-sum
+  cost-sum kwh-sum
+  overload-minutes overload-episodes overload-above-minutes in-overload? peak-demand
+  congested-minutes fast-only-minutes mode-switches borrowed-kwh
+  finalized?
+]
+
+breed [ transformers transformer ]
+breed [ stations station ]
+breed [ plugs plug ]
+breed [ evs ev ]
+
+stations-own [
+  station-id
+  alloc          ;; L_i (kW) allocation, changed only by the Local Grid
+  demand         ;; D_i : raw requested power (kW)
+  delivered      ;; power actually delivered (kW)
+  ratio          ;; R = (N_act + N_que) / C_station
+  mode           ;; "normal" or "fast-only"
+  mode-since     ;; tick when the current mode started
+  fast-price     ;; EUR/kWh: P_fast in normal mode, p(R) in fast-only mode
+  queue          ;; FIFO list of EVs waiting for a plug
+]
+
+plugs-own [ home-station plug-type max-kw occupied? current-ev ]
+
+evs-own [
+  battery-cap    ;; kWh
+  soc            ;; current energy (kWh)
+  target-kwh     ;; energy needed to count as served
+  arrive-tick
+  ready-tick     ;; when the EV started waiting for a plug
+  charge-start   ;; tick when the EV was connected to a plug
+  depart-tick
+  urgent?
+  price-limit    ;; highest price the EV accepts (EUR/kWh)
+  session-price  ;; price agreed at station choice (EUR/kWh)
+  energy-got     ;; kWh received so far
+  my-station
+  my-plug
+  state          ;; "waiting" or "charging"
+  rate           ;; current charging power (kW)
+]
+
+;; ---------------------------------------------------------------
+;; SETUP
+;; ---------------------------------------------------------------
+
+;; Setup button: clears the world and builds a fresh model with a random seed.
+to setup
+  clear-all
+  init-model
+end
+
+;; Same as setup but with a fixed random seed. Used by run-protocol so that
+;; seed k gives exactly the same EVs in every scenario.
+to setup-seeded [ s ]
+  clear-all
+  random-seed s
+  init-model
+end
+
+;; Builds everything in a fixed order: world size, parameters, the EV arrival
+;; schedule (first RNG use, so it is identical in all scenarios), scenario
+;; flags, loan ledger, transformer, stations, plugs, display, and finally the
+;; "Price vs R" plot (after reset-ticks so the pens stay).
+to init-model
+  resize-world -16 16 -16 16
+  set-patch-size 13
+  set-parameters
+  build-schedule
+  set-scenario-flags
+  set loan-matrix n-values ((length station-coords) * (length station-coords)) [ 0 ]
+  set in-overload? false
+  set finalized? false
+  set plots-live? true
+  setup-transformer
+  setup-stations
+  setup-plugs
+  ask stations [ update-ratio ]
+  update-labels
+  reset-ticks
+  if price-plot-wanted? [ setup-price-plots ]
+end
+
+;; Holds every model constant in one place. c-main = 820 kW = 4 x 205 kW
+;; (205 kW is the starting allocation of one station, NOT a hard cap).
+to set-parameters
+  set c-main 820                 ;; transformer capacity (kW)
+  set n-slow 5                   ;; slow-designated plugs per station
+  set n-fast 5                   ;; fast plugs per station
+  set w-slow 11                  ;; slow plug power (kW)
+  set w-fast 30                  ;; fast plug power (kW)
+  set r-high 0.8                 ;; congestion threshold: fast-only mode starts here
+  set r-max 1.0                  ;; R at which Method 2 reaches the price cap
+  set min-mode-duration 10       ;; minutes a station stays in a newly entered mode
+  set p-slow 0.35                ;; EUR/kWh slow charging (normal mode)
+  set p-fast 0.60                ;; EUR/kWh fast charging (normal mode)
+  set p-cap 0.80                 ;; EUR/kWh maximum fast-only price
+  set p-urgent 0.3               ;; share of urgent EVs
+  set required-charge 0.8        ;; EV is served at 80% of its battery
+  set sim-length 10080           ;; 7 days of 1-minute steps
+  set min-arrivals 5            ;; EV arrivals per hour are kept inside 5-20
+  set max-arrivals 20
+  set limit-non-lo 0.40          ;; price-acceptance limits (EUR/kWh), proposed values
+  set limit-non-hi 0.70          ;;   non-urgent EVs
+  set limit-urg-lo 0.70          ;;   urgent EVs accept higher prices
+  set limit-urg-hi 1.00
+  set parking-min 60             ;; shortest parking time (min)
+  set capped-scale 480 / 540     ;; capped scenarios: parking 60-540 min (mean 5 h)
+  ;; station positions (x y). Any of them can become the busy one.
+  set station-coords (list (list -8 8) (list 8 8) (list -8 -8) (list 8 -8))
+  ;; ---- SURGE PARAMETERS (random busy station) ----
+  set surge-minutes 180          ;; SURGE-MINUTES: a random station is "busy" for 3 hours at a time
+  set surge-share 0.6            ;; SURGE-SHARE: share of arrivals in that window that appear
+                                 ;; near the busy station (0 = fully uniform traffic)
+  ;; -----------------------------------------------
+  set price-plot-wanted? true    ;; set to false if the "Price vs R" plot does not exist
+end
+
+;; Turns the chooser value into behaviour flags: which mechanisms are active
+;; in the selected scenario (fast-only mode, Local Grid, price-based station
+;; choice, price method, capped parking time).
+to set-scenario-flags
+  set use-fast-mode? false
+  set use-local-grid? false
+  set use-price-selection? false
+  set capped-parking? false
+  set price-method "none"
+  if scenario = "method1" or scenario = "method1-capped" [
+    set use-fast-mode? true
+    set use-local-grid? true
+    set use-price-selection? true
+    set price-method "step"
+  ]
+  if scenario = "method2" or scenario = "method2-capped" [
+    set use-fast-mode? true
+    set use-local-grid? true
+    set use-price-selection? true
+    set price-method "ramp"
+  ]
+  if scenario = "method1-capped" or scenario = "method2-capped" [ set capped-parking? true ]
+end
+
+;; Creates the transformer (yellow square in the middle of the map).
+to setup-transformer
+  create-transformers 1 [
+    setxy 0 0
+    set shape "square"
+    set color yellow
+    set size 2
+  ]
+end
+
+;; Creates the 4 charging stations at the positions in station-coords, each
+;; linked to the transformer, with an equal starting allocation c-main / 4.
+to setup-stations
+  let n-st length station-coords
+  let i 0
+  foreach station-coords [ c ->
+    create-stations 1 [
+      setxy (item 0 c) (item 1 c)
+      set station-id i
+      set shape "house"
+      set color sky
+      set size 2.5
+      set alloc c-main / n-st             ;; 820 / 4 = 205 kW each
+      set demand 0
+      set delivered 0
+      set ratio 0
+      set mode "normal"
+      set mode-since 0
+      set fast-price p-fast
+      set queue []
+      create-link-with one-of transformers
+    ]
+    set i i + 1
+  ]
+end
+
+;; Creates the plugs of every station from the observer (create-plugs cannot
+;; run inside an ask of turtles): one row of slow plugs and one row of fast plugs.
+to setup-plugs
+  foreach sort stations [ s ->
+    let sid [station-id] of s
+    let sx [xcor] of s
+    let sy [ycor] of s
+    make-plug-row sid sx (sy + 2.5) "slow" n-slow w-slow green
+    make-plug-row sid sx (sy - 2.5) "fast" n-fast w-fast orange
+  ]
+end
+
+;; Creates one horizontal row of n plugs of one type, centred on a station.
+to make-plug-row [ sid sx sy ptype n kw col ]
+  foreach range n [ i ->
+    create-plugs 1 [
+      setxy (sx + i - (n - 1) / 2) sy
+      set shape "square"
+      set size 0.8
+      set color col
+      set home-station sid
+      set plug-type ptype
+      set max-kw kw
+      set occupied? false
+      set current-ev nobody
+    ]
+  ]
+end
+
+;; ---------------------------------------------------------------
+;; ARRIVAL SCHEDULE (generated once per run, before anything else)
+;; ---------------------------------------------------------------
+
+;; Reads the arrivals slider and keeps it inside the allowed 10-40 EVs/hour.
+to-report clamped-arrivals
+  report max list min-arrivals (min list max-arrivals ev-arrivals-per-hour)
+end
+
+;; Mean number of arrivals per minute at tick t:
+;; base rate x time-of-day factor x holiday factor.
+;; Night 0.5, day 1, evening peak 17-22h 1.5, days 6-7 (holiday weekend) x1.2.
+to-report arrival-mean [ t ]
+  let h floor ((t mod 1440) / 60)
+  let d floor (t / 1440)
+  let m 1
+  if h < 6 [ set m 0.5 ]
+  if h >= 17 and h < 22 [ set m 1.5 ]
+  if d >= 5 [ set m m * 1.2 ]
+  report clamped-arrivals / 60 * m
+end
+
+;; Pre-generates ALL EVs of the week (Poisson arrivals per minute). First it
+;; draws one random busy station for every surge window, then one record per EV.
+;; Because this happens first, every scenario with the same seed gets the
+;; identical EV population (the capped scenarios rescale the parking time
+;; later, in init-ev, without drawing new random numbers).
+to build-schedule
+  set schedule []
+  set sched-i 0
+  let n-windows ceiling (sim-length / surge-minutes)
+  set surge-stations n-values n-windows [ random (length station-coords) ]
+  foreach range sim-length [ t ->
+    let n random-poisson (arrival-mean t)
+    repeat n [ set schedule lput (make-record t) schedule ]
+  ]
+end
+
+;; Draws the attributes of one EV: battery 40-80 kWh, 10-50% charge on arrival,
+;; parked 60-600 min (uniform, mean 5.5 h), urgent or not, price-acceptance
+;; limit, and arrival location.
+;; Location: with probability surge-share near the currently busy station,
+;; otherwise uniform over the map (the EV later picks its station from this).
+;; Record = [tick battery soc-fraction parked-minutes urgent? x y price-limit]
+to-report make-record [ t ]
+  let bat 40 + random-float 40
+  let frac 0.10 + random-float 0.40
+  let parked 60 + random 541
+  let urg? (random-float 1 < p-urgent)
+  let lim 0
+  ifelse urg?
+    [ set lim limit-urg-lo + random-float (limit-urg-hi - limit-urg-lo) ]
+    [ set lim limit-non-lo + random-float (limit-non-hi - limit-non-lo) ]
+  let px 0
+  let py 0
+  ifelse random-float 1 < surge-share [
+    let busy item (floor (t / surge-minutes)) surge-stations
+    let c item busy station-coords
+    set px ((item 0 c) + random-float 6 - 3)
+    set py ((item 1 c) + random-float 6 - 3)
+  ] [
+    set px (random-float 32 - 16)
+    set py (random-float 32 - 16)
+  ]
+  report (list t bat frac parked urg? px py lim)
+end
+
+;; ---------------------------------------------------------------
+;; MAIN LOOP  (one tick = one minute)
+;; ---------------------------------------------------------------
+
+;; One simulated minute. Order: update R -> update mode (10-min minimum in
+;; both directions) -> update price -> new arrivals choose a station ->
+;; queued EVs get plugs -> power is delivered and shared -> invariants are
+;; checked -> EVs charge -> departures -> Local Grid changes the allocation
+;; for the NEXT tick -> metrics, labels, plot.
+to go
+  if ticks >= sim-length [ stop ]
+  ask stations [ update-ratio ]
+  ask stations [ update-mode ]
+  ask stations [ update-price ]
+  spawn-arrivals
+  ask stations [ assign-plugs ]
+  ask stations [ deliver-power ]
+  check-invariants
+  ask evs with [ state = "charging" ] [ charge-step ]
+  handle-departures
+  local-grid-step
+  ask stations [ update-ratio ]
+  record-metrics
+  update-labels
+  if price-plot-wanted? and plots-live? [ update-price-plot ]
+  tick
+  if ticks >= sim-length [ finalize-run ]
+end
+
+;; ---------------------------------------------------------------
+;; EV ARRIVALS AND STATION CHOICE
+;; ---------------------------------------------------------------
+
+;; Creates the EVs of the pre-generated schedule whose arrival tick has come.
+to spawn-arrivals
+  let more? true
+  while [ more? ] [
+    ifelse sched-i >= length schedule [
+      set more? false
+    ] [
+      let rec item sched-i schedule
+      ifelse (item 0 rec) <= ticks [
+        set sched-i sched-i + 1
+        create-evs 1 [ init-ev rec ]
+      ] [
+        set more? false
+      ]
+    ]
+  ]
+end
+
+;; Initialises one new EV from its record, lets it choose a station and puts it
+;; in that station's queue. In the capped scenarios the parking time is
+;; rescaled: parked_capped = 60 + (parked - 60) * 480 / 540 (same random draw).
+;; An EV that finds no acceptable station (price too high everywhere) leaves
+;; at once and is counted as balked + unserved.
+to init-ev [ rec ]
+  let parked item 3 rec
+  if capped-parking? [ set parked parking-min + (parked - parking-min) * capped-scale ]
+  set arrive-tick ticks
+  set ready-tick ticks
+  set charge-start ticks
+  set battery-cap item 1 rec
+  set soc battery-cap * (item 2 rec)
+  set depart-tick ticks + parked
+  set urgent? item 4 rec
+  set price-limit item 7 rec
+  set target-kwh battery-cap * required-charge
+  set session-price 0
+  set energy-got 0
+  set my-plug nobody
+  set my-station nobody
+  set rate 0
+  set shape "car"
+  set size 1.2
+  set color ifelse-value urgent? [ red ] [ white ]
+  setxy (item 5 rec) (item 6 rec)
+  choose-station
+  ifelse my-station = nobody [
+    set balked-count balked-count + 1
+    set unserved-count unserved-count + 1
+    set unserved-kwh unserved-kwh + max list 0 (target-kwh - soc)
+    die
+  ] [
+    let u urgent?
+    set session-price [quote-price u] of my-station
+    enqueue-ev
+  ]
+end
+
+;; Station choice. Price scenarios: drop stations whose quoted price is above
+;; the EV's limit, take the cheapest one, ties -> nearest, then lowest R.
+;; Uncontrolled: simply the nearest station.
+;; The EV never reroutes afterwards.
+to choose-station
+  let u urgent?
+  let lim price-limit
+  let ex xcor
+  let ey ycor
+  ifelse use-price-selection? [
+    let cands stations with [ quote-price u <= lim ]
+    ifelse any? cands [
+      let best-p min [quote-price u] of cands
+      let tied cands with [ quote-price u = best-p ]
+      let best-d min [distancexy ex ey] of tied
+      let tied2 tied with [ distancexy ex ey = best-d ]
+      set my-station min-one-of tied2 [ ratio ]
+    ] [
+      set my-station nobody
+    ]
+  ] [
+    set my-station min-one-of stations [ distancexy ex ey ]
+  ]
+end
+
+;; The price a station shows to an EV: in fast-only mode the current fast-only
+;; price; in normal mode P_fast for urgent EVs and P_slow for the others.
+to-report quote-price [ u ]
+  if mode = "fast-only" [ report fast-price ]
+  report ifelse-value u [ p-fast ] [ p-slow ]
+end
+
+;; Puts the EV at the back of its station's queue and starts its waiting clock.
+to enqueue-ev
+  set state "waiting"
+  set ready-tick ticks
+  ask my-station [ set queue lput myself queue ]
+  move-to-queue
+end
+
+;; Display only: places the EV in the waiting area next to its station.
+to move-to-queue
+  let s my-station
+  setxy ([xcor] of s + 4 + random-float 2.5) ([ycor] of s + random-float 2 - 1)
+end
+
+;; ---------------------------------------------------------------
+;; STATION PROCEDURES (run in station context)
+;; ---------------------------------------------------------------
+
+;; R = (N_act + N_que) / C_station: charging EVs plus queued EVs per plug.
+to update-ratio
+  let sid station-id
+  let n-act count plugs with [ home-station = sid and occupied? ]
+  set ratio (n-act + length queue) / (n-slow + n-fast)
+end
+
+;; Mode rule (report Eq. 2): normal -> fast-only when R >= r-high (0.8);
+;; fast-only -> normal when R < r-high. In BOTH directions a station must have
+;; stayed at least min-mode-duration (10 min) in its current mode before it may
+;; switch. Inactive in scenarios without fast-only mode.
+to update-mode
+  let target mode
+  ifelse not use-fast-mode? [
+    set target "normal"
+  ] [
+    if (ticks - mode-since) >= min-mode-duration [
+      if mode = "normal" and ratio >= r-high [ set target "fast-only" ]
+      if mode = "fast-only" and ratio < r-high [ set target "normal" ]
+    ]
+  ]
+  if target != mode [ switch-mode target ]
+end
+
+;; Applies a mode change: the plugs designated slow run at 30 kW (fast power) in
+;; fast-only mode and return to 11 kW in normal mode. Slow plugs turn orange
+;; while they run fast. The change time is stored for the minimum duration.
+;; (Borrowed allocation is returned by local-grid-step.)
+to switch-mode [ new-mode ]
+  set mode new-mode
+  set mode-since ticks
+  set mode-switches mode-switches + 1
+  let sid station-id
+  let fast? (new-mode = "fast-only")
+  let kw ifelse-value fast? [ w-fast ] [ w-slow ]
+  ask plugs with [ home-station = sid and plug-type = "slow" ] [
+    set max-kw kw
+    set color ifelse-value fast? [ orange ] [ green ]
+  ]
+end
+
+;; The price the station broadcasts for fast charging (report Eq. 3 and 4).
+;; Normal mode: P_fast. Fast-only mode, Method 1: P_cap (step).
+;; Method 2 (ramp): P_fast + (P_cap - P_fast) * x(R) with
+;; x(R) = min(max((R - r-high) / (r-max - r-high), 0), 1).
+to update-price
+  ifelse mode = "fast-only" [
+    ifelse price-method = "step" [
+      set fast-price p-cap
+    ] [
+      let x min list 1 (max list 0 ((ratio - r-high) / (r-max - r-high)))
+      set fast-price p-fast + (p-cap - p-fast) * x
+    ]
+  ] [
+    set fast-price p-fast
+  ]
+end
+
+;; Moves EVs from the front of the queue onto free plugs (first come, first
+;; served). Urgent EVs prefer fast plugs, others prefer slow plugs; if the
+;; preferred type is full they take any free plug. Stops when no plug is free.
+to assign-plugs
+  let sid station-id
+  let keep-going? true
+  while [ keep-going? and not empty? queue ] [
+    let free-plugs plugs with [ home-station = sid and not occupied? ]
+    ifelse not any? free-plugs [
+      set keep-going? false
+    ] [
+      let the-ev first queue
+      let want ifelse-value [urgent?] of the-ev [ "fast" ] [ "slow" ]
+      let preferred free-plugs with [ plug-type = want ]
+      let chosen ifelse-value any? preferred [ one-of preferred ] [ one-of free-plugs ]
+      set queue but-first queue
+      start-charging the-ev chosen
+    ]
+  ]
+end
+
+;; Connects an EV to a plug: marks the plug occupied, sets the EV to "charging",
+;; stores the charge-start tick and records how long it waited (ready-tick to
+;; now) for the waiting-time metric.
+to start-charging [ the-ev the-plug ]
+  ask the-plug [
+    set occupied? true
+    set current-ev the-ev
+  ]
+  ask the-ev [
+    set state "charging"
+    set my-plug the-plug
+    set charge-start ticks
+    set wait-count wait-count + 1
+    set wait-sum wait-sum + (ticks - ready-tick)
+    setxy [xcor] of the-plug [ycor] of the-plug
+  ]
+end
+
+;; Power for one station (report Eq. 7): D_i = sum of the occupied plugs'
+;; maximum power, delivered = min(D_i, L_i), shared equally among the charging
+;; EVs, and no EV gets more than its own plug maximum. The station's delivered
+;; power is the sum of what its EVs actually receive.
+to deliver-power
+  let sid station-id
+  let used plugs with [ home-station = sid and occupied? ]
+  set demand sum [max-kw] of used
+  let cap-now min list demand alloc
+  let n count used
+  if n > 0 [
+    let share cap-now / n
+    ask used [
+      let m max-kw
+      ask current-ev [ set rate min list m share ]
+    ]
+  ]
+  set delivered sum [ [rate] of current-ev ] of used
+end
+
+;; ---------------------------------------------------------------
+;; LOCAL GRID (observer procedures)
+;; ---------------------------------------------------------------
+
+;; Local Grid (report Section 3.3). Runs at the end of a tick, so the changed
+;; allocation is used on the NEXT tick (1-step delay). Allocation persists:
+;; it is NOT reset every tick. Step 1: every station that is back in normal
+;; mode returns what it borrowed to the donors (return-loans). Step 2: the
+;; stations in fast-only mode, in fixed station order, request their shortfall
+;; (request-allocation). It only moves existing allocation, so
+;; sum(alloc) = c-main always holds.
+to local-grid-step
+  foreach sort-on [station-id] stations [ b ->
+    if [mode] of b = "normal" [ return-loans b ]
+  ]
+  if use-local-grid? [
+    foreach sort-on [station-id] stations [ a ->
+      if [mode] of a = "fast-only" [ request-allocation a ]
+    ]
+  ]
+  set borrowed-kwh borrowed-kwh + borrowed-kw / 60
+  check-alloc-sum
+end
+
+;; One request of station a (report Eq. 5 and 6): need = max(D_A - L_A, 0).
+;; Donor B = station with the LARGEST headroom H_B = max(L_B - D_B, 0), ties
+;; broken by station ID; stations that currently hold borrowed power are not
+;; used as donors. One donor per request: delta = min(need, H_B),
+;; L_A' = L_A + delta, L_B' = L_B - delta. If no donor has headroom, delta = 0
+;; and the unmet demand waits (the request is repeated next tick). The loan is
+;; written in the ledger so it can be returned to this donor later.
+to request-allocation [ a ]
+  let n count stations
+  let aid [station-id] of a
+  let need max list 0 ([demand] of a - [alloc] of a)
+  if need > 0.001 [
+    let donors stations with [ self != a and (borrowed-amount station-id) < 0.001 and (alloc - demand) > 0.001 ]
+    if any? donors [
+      let best max [alloc - demand] of donors
+      let donor min-one-of (donors with [ alloc - demand = best ]) [ station-id ]
+      let delta min list need best
+      ask a [ set alloc alloc + delta ]
+      ask donor [ set alloc alloc - delta ]
+      let k aid * n + [station-id] of donor
+      set loan-matrix replace-item k loan-matrix ((item k loan-matrix) + delta)
+    ]
+  ]
+end
+
+;; Station b is back in normal mode: every loan it holds goes back to its donor
+;; (b's allocation decreases, the donor's increases) and the ledger is cleared.
+to return-loans [ b ]
+  let n count stations
+  let bid [station-id] of b
+  foreach range n [ d ->
+    let k bid * n + d
+    let amt item k loan-matrix
+    if amt > 0 [
+      let donor one-of stations with [ station-id = d ]
+      ask donor [ set alloc alloc + amt ]
+      ask b [ set alloc alloc - amt ]
+      set loan-matrix replace-item k loan-matrix 0
+    ]
+  ]
+end
+
+;; Total power (kW) that the station with id sid currently borrows.
+to-report borrowed-amount [ sid ]
+  let n count stations
+  report sum n-values n [ d -> item (sid * n + d) loan-matrix ]
+end
+
+;; Invariant check, called every tick (after power is delivered): the sum of
+;; all allocations must equal c-main, no allocation may be negative and no
+;; station may deliver more than its allocation. Stops the run with an error
+;; message if one of them is violated.
+to check-invariants
+  check-alloc-sum
+  ask stations [
+    if alloc < -0.001 [
+      error (word "Invariant violated at tick " ticks ": station " (station-id + 1) " has negative allocation " alloc)
+    ]
+    if delivered > alloc + 0.001 [
+      error (word "Invariant violated at tick " ticks ": station " (station-id + 1) " delivers " delivered " kW but L = " alloc " kW")
+    ]
+  ]
+end
+
+;; Part of check-invariants: sum(L_i) must equal c-main (also called right
+;; after every Local Grid step).
+to check-alloc-sum
+  if abs (total-alloc - c-main) > 0.001 [
+    error (word "Invariant violated at tick " ticks ": sum of allocations = " total-alloc " kW, expected " c-main " kW")
+  ]
+end
+
+;; ---------------------------------------------------------------
+;; EV PROCEDURES
+;; ---------------------------------------------------------------
+
+;; One minute of charging: adds rate (kW) / 60 kWh to the battery and to the
+;; energy counters.
+to charge-step
+  set soc soc + rate / 60
+  set energy-got energy-got + rate / 60
+  set energy-delivered energy-delivered + rate / 60
+end
+
+;; Removes finished or expired EVs. An EV that reached its target is "served"
+;; (its cost, its time from arrival and its time from the START of charging to
+;; 80% are recorded). An EV whose parking time ran out is "unserved" (also if it
+;; was still waiting; then it leaves the queue). Either way the plug is freed.
+to handle-departures
+  ask evs [
+    ifelse state = "charging" and soc >= target-kwh [
+      set cost-sum cost-sum + session-price * energy-got
+      set kwh-sum kwh-sum + energy-got
+      set time-sum time-sum + (ticks - arrive-tick)
+      set charge-time-sum charge-time-sum + (ticks - charge-start)
+      release-plug
+      set served-count served-count + 1
+      die
+    ] [
+      if ticks >= depart-tick [
+        if state = "waiting" [
+          set wait-count wait-count + 1
+          set wait-sum wait-sum + (ticks - ready-tick)
+          let me self
+          ask my-station [ set queue remove me queue ]
+        ]
+        release-plug
+        set unserved-count unserved-count + 1
+        set unserved-kwh unserved-kwh + max list 0 (target-kwh - soc)
+        die
+      ]
+    ]
+  ]
+end
+
+;; Frees the plug an EV was using (no effect if it never had one).
+to release-plug
+  if my-plug != nobody [
+    ask my-plug [
+      set occupied? false
+      set current-ev nobody
+    ]
+  ]
+end
+
+;; Called once when the week ends: EVs still in the system did not reach the
+;; required charge in time, so they count as unserved.
+to finalize-run
+  if not finalized? [
+    set finalized? true
+    ask evs [
+      set unserved-count unserved-count + 1
+      set unserved-kwh unserved-kwh + max list 0 (target-kwh - soc)
+      if state = "waiting" [
+        set wait-count wait-count + 1
+        set wait-sum wait-sum + (ticks - ready-tick)
+      ]
+    ]
+  ]
+end
+
+;; ---------------------------------------------------------------
+;; METRICS, DISPLAY AND PLOTS
+;; ---------------------------------------------------------------
+
+;; Per-minute bookkeeping. Overload demand event (report Section 5.1): total
+;; requested demand EQUALS c-main; consecutive minutes form one episode.
+;; Diagnostic: minutes with total demand ABOVE c-main (overload-above-minutes).
+;; Also tracks peak demand, delivered load, congested-station minutes
+;; (R >= r-high), fast-only minutes and unmet power (requested - delivered).
+to record-metrics
+  let td total-demand
+  if td > peak-demand [ set peak-demand td ]
+  ifelse td = c-main [
+    set overload-minutes overload-minutes + 1
+    if not in-overload? [
+      set overload-episodes overload-episodes + 1
+      set in-overload? true
+    ]
+  ] [
+    set in-overload? false
+  ]
+  if td > c-main [ set overload-above-minutes overload-above-minutes + 1 ]
+  set delivered-sum delivered-sum + total-delivered
+  set congested-minutes congested-minutes + count stations with [ ratio >= r-high ]
+  set fast-only-minutes fast-only-minutes + count stations with [ mode = "fast-only" ]
+  set unmet-kwh unmet-kwh + (sum [demand - delivered] of stations) / 60
+end
+
+;; Updates the labels and colours in the view: stations show
+;; R, mode, requested/delivered kW and allocation L (violet = fast-only);
+;; the transformer shows delivered/c-main and turns red while requested
+;; demand is above c-main.
+to update-labels
+  ask stations [
+    set label (word "S" (station-id + 1) " R=" (precision ratio 1)
+                    (ifelse-value (mode = "fast-only") [ " FAST " ] [ " norm " ])
+                    (round demand) "/" (round delivered) " L=" (round alloc))
+    set color ifelse-value (mode = "fast-only") [ violet ] [ sky ]
+  ]
+  ask transformers [
+    set label (word (round total-delivered) "/" c-main " kW")
+    set color ifelse-value (total-demand > c-main) [ red ] [ yellow ]
+  ]
+end
+
+;; "Price vs R" plot, drawn once at setup (called at the end of init-model):
+;; reference curves from the formulas (gray = slow price in normal mode,
+;; red = Method 1 step, blue = Method 2 ramp) plus one point-pen per station
+;; (S1..S4) for its live position.
+to setup-price-plots
+  set-current-plot "Price vs R"
+  clear-plot
+  ;; slow price in normal mode (valid below r-high)
+  create-temporary-plot-pen "slow (normal)"
+  set-plot-pen-color gray
+  plot-pen-up
+  plotxy 0 p-slow
+  plot-pen-down
+  plotxy r-high p-slow
+  ;; Method 1: P_fast below r-high, jumps to P_cap at r-high
+  create-temporary-plot-pen "Method 1 step"
+  set-plot-pen-color red
+  plot-pen-up
+  plotxy 0 p-fast
+  plot-pen-down
+  plotxy r-high p-fast
+  plotxy r-high p-cap
+  plotxy 2 p-cap
+  ;; Method 2: P_fast until r-high, ramps up to P_cap at r-max
+  create-temporary-plot-pen "Method 2 ramp"
+  set-plot-pen-color blue
+  plot-pen-up
+  plotxy 0 p-fast
+  plot-pen-down
+  plotxy r-high p-fast
+  plotxy r-max p-cap
+  plotxy 2 p-cap
+  ;; live station points: one point-mode pen per station (S1..S4)
+  foreach range (length station-coords) [ i ->
+    create-temporary-plot-pen (word "S" (i + 1))
+    set-plot-pen-mode 2
+    set-plot-pen-color item i (list sky orange lime magenta)
+  ]
+end
+
+;; Every tick: moves each station's point in the "Price vs R" plot to its
+;; current (R, price). R is clipped at 2 so the point stays on the graph.
+to update-price-plot
+  set-current-plot "Price vs R"
+  ask stations [
+    set-current-plot-pen (word "S" (station-id + 1))
+    plot-pen-reset
+    plotxy (min list ratio 2) fast-price
+  ]
+end
+
+;; Total requested power of all stations (kW).
+to-report total-demand
+  report sum [demand] of stations
+end
+
+;; Total power actually delivered (kW); never above c-main.
+to-report total-delivered
+  report sum [delivered] of stations
+end
+
+;; Sum of all allocations; should always equal c-main (820).
+to-report total-alloc
+  report sum [alloc] of stations
+end
+
+;; Power (kW) currently borrowed from donors (sum of the loan ledger).
+to-report borrowed-kw
+  report sum loan-matrix
+end
+
+;; Number of EVs currently charging.
+to-report n-charging
+  report count plugs with [ occupied? ]
+end
+
+;; Number of EVs waiting for a plug in all station queues.
+to-report n-waiting
+  report sum [length queue] of stations
+end
+;; Shows R of every station (and its mode) as one text, for a monitor.
+to-report r-display
+  report reduce [ [a b] -> (word a "   " b) ]
+    map [ s -> (word "S" ([station-id] of s + 1) ": R=" (precision [ratio] of s 2)
+                     (ifelse-value ([mode] of s = "fast-only") [ " FAST" ] [ " norm" ])) ]
+        sort-on [station-id] stations
+end
+
+;; Number of stations currently in fast-only mode.
+to-report fast-only-stations
+  report count stations with [ mode = "fast-only" ]
+end
+
+;; Percent of EVs that reached the required charge before leaving
+;; (balked EVs count as unserved).
+to-report service-rate
+  let total served-count + unserved-count
+  report ifelse-value (total > 0) [ 100 * served-count / total ] [ 0 ]
+end
+;; "fulfilled / all EVs that finished or left" with the percentage.
+to-report fulfilled-display
+  let total served-count + unserved-count
+  report (word served-count " of " total " EVs ("
+               (precision service-rate 1) "%)")
+end
+
+;; Number of EVs that did not reach 80% although they got a plug or were in the
+;; system (unserved EVs minus the balked ones, which never entered a station).
+to-report below80-evs
+  report unserved-count - balked-count
+end
+
+;; Percent of admitted EVs that left without reaching 80% charge.
+to-report below80-share
+  let admitted served-count + below80-evs
+  report ifelse-value (admitted > 0) [
+    100 * below80-evs / admitted
+  ] [ 0 ]
+end
+
+;; Mean minutes from becoming ready to the start of charging (all EVs).
+to-report avg-wait
+  report ifelse-value (wait-count > 0) [ wait-sum / wait-count ] [ 0 ]
+end
+
+;; Average charging time (report Section 5.3, output 2): minutes from the START
+;; of charging (plug connected) until the EV reaches 80%, over served EVs.
+to-report avg-time-to-charge
+  report ifelse-value (served-count > 0) [ charge-time-sum / served-count ] [ 0 ]
+end
+
+;; Extra output: minutes from ARRIVAL until 80% (waiting + charging), over
+;; served EVs. This is the old definition of avg-time-to-charge.
+to-report avg-time-from-arrival
+  report ifelse-value (served-count > 0) [ time-sum / served-count ] [ 0 ]
+end
+
+;; Mean delivered load divided by the installed maximum requested capacity
+;; (4 stations x 10 plugs x 30 kW = 1200 kW).
+to-report load-factor
+  report ifelse-value (ticks > 0)
+    [ delivered-sum / (ticks * count stations * (n-slow + n-fast) * w-fast) ]
+    [ 0 ]
+end
+
+;; Energy-weighted average price in EUR/kWh paid by served EVs.
+to-report avg-price
+  report ifelse-value (kwh-sum > 0) [ cost-sum / kwh-sum ] [ 0 ]
+end
+
+;; Current day of the simulated week (1-7).
+to-report day-number
+  report floor (ticks / 1440) + 1
+end
+
+;; Current hour of the simulated day (0-23).
+to-report clock-hour
+  report floor ((ticks mod 1440) / 60)
+end
+
+;; ---------------------------------------------------------------
+;; RUN BUTTONS
+;; ---------------------------------------------------------------
+
+;; One click: setup + run the whole week (button: Forever OFF).
+to run-simulation
+  setup
+  while [ ticks < sim-length ] [ go ]
+end
+
+;; Fast forward: runs 60 ticks (1 simulated hour) per screen redraw
+;; (button: Forever ON; stops by itself at the end of the week).
+to go-fast
+  no-display
+  repeat 60 [ if ticks < sim-length [ go ] ]
+  display
+  if ticks >= sim-length [ stop ]
+end
+
+;; ---------------------------------------------------------------
+;; FULL PROTOCOL: 5 scenarios x 30 seeds -> protocol_results.csv
+;; ---------------------------------------------------------------
+
+;; Runs every scenario for seeds 1..5 and writes one result row per run to
+;; protocol_results.csv (next to the model file). Same seed = same EVs in all
+;; scenarios. The live plot is switched off during batch runs for speed.
+;; Button: Forever OFF.
+to run-protocol
+  let scenarios [ "uncontrolled" "method1" "method2" "method1-capped" "method2-capped" ]
+  let n-runs 30
+  let out-file "protocol_results.csv"
+  if file-exists? out-file [ file-delete out-file ]
+  file-open out-file
+  file-print "scenario,seed,overload_minutes,overload_episodes,avg_charging_time_min,service_rate_pct,below80_evs,below80_share_pct,overload_above_minutes,avg_time_from_arrival,avg_wait_min,peak_demand_kw,balked_evs,avg_price_eur_kwh,unserved_kwh,unmet_kwh,fast_only_station_minutes,borrowed_kwh"
+  file-close
+  no-display
+  foreach scenarios [ s ->
+    foreach (range 1 (n-runs + 1)) [ seed ->
+      set scenario s
+      setup-seeded seed
+      set plots-live? false
+      while [ ticks < sim-length ] [ go ]
+      write-result-row s seed
+      print (word s " seed " seed " done")
+    ]
+  ]
+  display
+  print "protocol finished: protocol_results.csv"
+end
+
+;; Appends the final metrics of one finished run as one CSV row. The three main
+;; outputs (overload demand, average charging time, service rate) come first.
+to write-result-row [ s seed ]
+  file-open "protocol_results.csv"
+  file-print (word s "," seed ","
+    overload-minutes "," overload-episodes ","
+    (precision avg-time-to-charge 2) "," (precision service-rate 2) ","
+    below80-evs "," (precision below80-share 2) ","
+    overload-above-minutes "," (precision avg-time-from-arrival 2) ","
+    (precision avg-wait 2) "," (precision peak-demand 1) "," balked-count ","
+    (precision avg-price 4) ","
+    (precision unserved-kwh 1) "," (precision unmet-kwh 1) ","
+    fast-only-minutes "," (precision borrowed-kwh 1))
+  file-close
+end]]></code>
+  <widgets>
+    <view x="325" wrappingAllowedX="true" y="70" frameRate="30.0" minPycor="-16" height="434" showTickCounter="true" patchSize="13.0" fontSize="10" wrappingAllowedY="true" width="434" tickCounterLabel="ticks" maxPycor="16" updateMode="0" maxPxcor="16" minPxcor="-16"></view>
+    <chooser x="35" y="45" height="60" variable="scenario" current="2" width="250" display="scenario">
+      <choice type="string" value="uncontrolled"></choice>
+      <choice type="string" value="method1"></choice>
+      <choice type="string" value="method2"></choice>
+      <choice type="string" value="method1-capped"></choice>
+      <choice type="string" value="method2-capped"></choice>
+    </chooser>
+    <slider x="35" step="2" y="125" max="20" width="250" display="ev-arrivals-per-hour" height="50" min="5" direction="Horizontal" default="20.0" variable="ev-arrivals-per-hour"></slider>
+    <button x="35" y="195" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="55">setup</button>
+    <button x="35" y="255" height="40" disableUntilTicks="false" forever="true" kind="Observer" width="55">go</button>
+    <button x="35" y="305" height="40" disableUntilTicks="false" forever="true" kind="Observer" width="75">go-fast</button>
+    <button x="35" y="355" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="100">run-simulation</button>
+    <button x="35" y="405" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="90">run-protocol</button>
+    <monitor x="20" precision="17" y="535" height="145" fontSize="11" width="405">r-display</monitor>
+    <monitor x="435" precision="17" y="535" height="90" fontSize="11" width="230">fulfilled-display</monitor>
+    <plot x="785" autoPlotX="true" yMax="0.9" autoPlotY="false" yAxis="EUR/kWh" y="85" xMin="0.0" height="315" legend="true" xMax="2.0" yMin="0.3" xAxis="R" display="Price vs R" width="325" sizeVersion="0">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="default" color="-16777216" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+    </plot>
+  </widgets>
+  <info>## WHAT IS IT?
+
+(a general understanding of what the model is trying to show or explain)
+
+## HOW IT WORKS
+
+(what rules the agents use to create the overall behavior of the model)
+
+## HOW TO USE IT
+
+(how to use the model, including a description of each of the items in the Interface tab)
+
+## THINGS TO NOTICE
+
+(suggested things for the user to notice while running the model)
+
+## THINGS TO TRY
+
+(suggested things for the user to try to do (move sliders, switches, etc.) with the model)
+
+## EXTENDING THE MODEL
+
+(suggested things to add or change in the Code tab to make the model more complicated, detailed, accurate, etc.)
+
+## NETLOGO FEATURES
+
+(interesting or unusual features of NetLogo that the model uses, particularly in the Code tab; or where workarounds were needed for missing features)
+
+## RELATED MODELS
+
+(models in the NetLogo Models Library and elsewhere which are of related interest)
+
+## CREDITS AND REFERENCES
+
+(a reference to the model's URL on the web if it has one, as well as any other necessary credits, citations, and links)
+</info>
+  <turtleShapes>
+    <shape name="default" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="5"></point>
+        <point x="40" y="250"></point>
+        <point x="150" y="205"></point>
+        <point x="260" y="250"></point>
+      </polygon>
+    </shape>
+    <shape name="airplane" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="135" y="15"></point>
+        <point x="120" y="60"></point>
+        <point x="120" y="105"></point>
+        <point x="15" y="165"></point>
+        <point x="15" y="195"></point>
+        <point x="120" y="180"></point>
+        <point x="135" y="240"></point>
+        <point x="105" y="270"></point>
+        <point x="120" y="285"></point>
+        <point x="150" y="270"></point>
+        <point x="180" y="285"></point>
+        <point x="210" y="270"></point>
+        <point x="165" y="240"></point>
+        <point x="180" y="180"></point>
+        <point x="285" y="195"></point>
+        <point x="285" y="165"></point>
+        <point x="180" y="105"></point>
+        <point x="180" y="60"></point>
+        <point x="165" y="15"></point>
+      </polygon>
+    </shape>
+    <shape name="arrow" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="0" y="150"></point>
+        <point x="105" y="150"></point>
+        <point x="105" y="293"></point>
+        <point x="195" y="293"></point>
+        <point x="195" y="150"></point>
+        <point x="300" y="150"></point>
+      </polygon>
+    </shape>
+    <shape name="box" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="285"></point>
+        <point x="285" y="225"></point>
+        <point x="285" y="75"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="135"></point>
+        <point x="15" y="75"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="75"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="75"></point>
+        <point x="15" y="225"></point>
+        <point x="150" y="285"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <line endX="150" startY="285" marked="false" color="255" endY="135" startX="150"></line>
+      <line endX="15" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+      <line endX="285" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+    </shape>
+    <shape name="bug" rotatable="true" editableColorIndex="0">
+      <circle x="96" y="182" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="110" y="127" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <circle x="110" y="75" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <line endX="80" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+      <line endX="220" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+    </shape>
+    <shape name="butterfly" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="209" y="199"></point>
+        <point x="225" y="225"></point>
+        <point x="225" y="255"></point>
+        <point x="195" y="270"></point>
+        <point x="165" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="89" y="198"></point>
+        <point x="75" y="225"></point>
+        <point x="75" y="255"></point>
+        <point x="105" y="270"></point>
+        <point x="135" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="139" y="148"></point>
+        <point x="100" y="105"></point>
+        <point x="55" y="90"></point>
+        <point x="25" y="90"></point>
+        <point x="10" y="105"></point>
+        <point x="10" y="135"></point>
+        <point x="25" y="180"></point>
+        <point x="40" y="195"></point>
+        <point x="85" y="194"></point>
+        <point x="139" y="163"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="162" y="150"></point>
+        <point x="200" y="105"></point>
+        <point x="245" y="90"></point>
+        <point x="275" y="90"></point>
+        <point x="290" y="105"></point>
+        <point x="290" y="135"></point>
+        <point x="275" y="180"></point>
+        <point x="260" y="195"></point>
+        <point x="215" y="195"></point>
+        <point x="162" y="165"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="135" y="225"></point>
+        <point x="120" y="150"></point>
+        <point x="135" y="120"></point>
+        <point x="150" y="105"></point>
+        <point x="165" y="120"></point>
+        <point x="180" y="150"></point>
+        <point x="165" y="225"></point>
+      </polygon>
+      <circle x="135" y="90" marked="false" color="255" diameter="30" filled="true"></circle>
+      <line endX="195" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+      <line endX="105" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+    </shape>
+    <shape name="car" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="300" y="180"></point>
+        <point x="279" y="164"></point>
+        <point x="261" y="144"></point>
+        <point x="240" y="135"></point>
+        <point x="226" y="132"></point>
+        <point x="213" y="106"></point>
+        <point x="203" y="84"></point>
+        <point x="185" y="63"></point>
+        <point x="159" y="50"></point>
+        <point x="135" y="50"></point>
+        <point x="75" y="60"></point>
+        <point x="0" y="150"></point>
+        <point x="0" y="165"></point>
+        <point x="0" y="225"></point>
+        <point x="300" y="225"></point>
+        <point x="300" y="180"></point>
+      </polygon>
+      <circle x="180" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <circle x="30" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="162" y="80"></point>
+        <point x="132" y="78"></point>
+        <point x="134" y="135"></point>
+        <point x="209" y="135"></point>
+        <point x="194" y="105"></point>
+        <point x="189" y="96"></point>
+        <point x="180" y="89"></point>
+      </polygon>
+      <circle x="47" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+      <circle x="195" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+    </shape>
+    <shape name="circle" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="circle 2" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+    </shape>
+    <shape name="cow" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="200" y="193"></point>
+        <point x="197" y="249"></point>
+        <point x="179" y="249"></point>
+        <point x="177" y="196"></point>
+        <point x="166" y="187"></point>
+        <point x="140" y="189"></point>
+        <point x="93" y="191"></point>
+        <point x="78" y="179"></point>
+        <point x="72" y="211"></point>
+        <point x="49" y="209"></point>
+        <point x="48" y="181"></point>
+        <point x="37" y="149"></point>
+        <point x="25" y="120"></point>
+        <point x="25" y="89"></point>
+        <point x="45" y="72"></point>
+        <point x="103" y="84"></point>
+        <point x="179" y="75"></point>
+        <point x="198" y="76"></point>
+        <point x="252" y="64"></point>
+        <point x="272" y="81"></point>
+        <point x="293" y="103"></point>
+        <point x="285" y="121"></point>
+        <point x="255" y="121"></point>
+        <point x="242" y="118"></point>
+        <point x="224" y="167"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="73" y="210"></point>
+        <point x="86" y="251"></point>
+        <point x="62" y="249"></point>
+        <point x="48" y="208"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="25" y="114"></point>
+        <point x="16" y="195"></point>
+        <point x="9" y="204"></point>
+        <point x="23" y="213"></point>
+        <point x="25" y="200"></point>
+        <point x="39" y="123"></point>
+      </polygon>
+    </shape>
+    <shape name="cylinder" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="dot" rotatable="false" editableColorIndex="0">
+      <circle x="90" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+    </shape>
+    <shape name="face happy" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="90" y="239"></point>
+        <point x="62" y="213"></point>
+        <point x="47" y="191"></point>
+        <point x="67" y="179"></point>
+        <point x="90" y="203"></point>
+        <point x="109" y="218"></point>
+        <point x="150" y="225"></point>
+        <point x="192" y="218"></point>
+        <point x="210" y="203"></point>
+        <point x="227" y="181"></point>
+        <point x="251" y="194"></point>
+        <point x="236" y="217"></point>
+        <point x="212" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="face neutral" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="7" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <rectangle endX="240" startY="195" marked="false" color="255" endY="225" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="face sad" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="168"></point>
+        <point x="90" y="184"></point>
+        <point x="62" y="210"></point>
+        <point x="47" y="232"></point>
+        <point x="67" y="244"></point>
+        <point x="90" y="220"></point>
+        <point x="109" y="205"></point>
+        <point x="150" y="198"></point>
+        <point x="192" y="205"></point>
+        <point x="210" y="220"></point>
+        <point x="227" y="242"></point>
+        <point x="251" y="229"></point>
+        <point x="236" y="206"></point>
+        <point x="212" y="183"></point>
+      </polygon>
+    </shape>
+    <shape name="fish" rotatable="false" editableColorIndex="0">
+      <polygon color="-1" filled="true" marked="false">
+        <point x="44" y="131"></point>
+        <point x="21" y="87"></point>
+        <point x="15" y="86"></point>
+        <point x="0" y="120"></point>
+        <point x="15" y="150"></point>
+        <point x="0" y="180"></point>
+        <point x="13" y="214"></point>
+        <point x="20" y="212"></point>
+        <point x="45" y="166"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="135" y="195"></point>
+        <point x="119" y="235"></point>
+        <point x="95" y="218"></point>
+        <point x="76" y="210"></point>
+        <point x="46" y="204"></point>
+        <point x="60" y="165"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="75" y="45"></point>
+        <point x="83" y="77"></point>
+        <point x="71" y="103"></point>
+        <point x="86" y="114"></point>
+        <point x="166" y="78"></point>
+        <point x="135" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="136"></point>
+        <point x="151" y="77"></point>
+        <point x="226" y="81"></point>
+        <point x="280" y="119"></point>
+        <point x="292" y="146"></point>
+        <point x="292" y="160"></point>
+        <point x="287" y="170"></point>
+        <point x="270" y="195"></point>
+        <point x="195" y="210"></point>
+        <point x="151" y="212"></point>
+        <point x="30" y="166"></point>
+      </polygon>
+      <circle x="215" y="106" marked="false" color="255" diameter="30" filled="true"></circle>
+    </shape>
+    <shape name="flag" rotatable="false" editableColorIndex="0">
+      <rectangle endX="75" startY="15" marked="true" color="-1920102913" endY="300" startX="60" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="90" y="150"></point>
+        <point x="270" y="90"></point>
+        <point x="90" y="30"></point>
+      </polygon>
+      <line endX="90" startY="135" marked="true" color="-1920102913" endY="135" startX="75"></line>
+      <line endX="90" startY="45" marked="true" color="-1920102913" endY="45" startX="75"></line>
+    </shape>
+    <shape name="flower" rotatable="false" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="135" y="120"></point>
+        <point x="165" y="165"></point>
+        <point x="180" y="210"></point>
+        <point x="180" y="240"></point>
+        <point x="150" y="300"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="240"></point>
+        <point x="195" y="195"></point>
+        <point x="165" y="135"></point>
+      </polygon>
+      <circle x="85" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="147" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="192" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="85" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="70" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="25" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="96" y="51" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="113" y="68" marked="false" color="255" diameter="74" filled="true"></circle>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="189" y="233"></point>
+        <point x="219" y="188"></point>
+        <point x="249" y="173"></point>
+        <point x="279" y="188"></point>
+        <point x="234" y="218"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="180" y="255"></point>
+        <point x="150" y="210"></point>
+        <point x="105" y="210"></point>
+        <point x="75" y="240"></point>
+        <point x="135" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="house" rotatable="false" editableColorIndex="0">
+      <rectangle endX="255" startY="120" marked="true" color="-1920102913" endY="285" startX="45" filled="true"></rectangle>
+      <rectangle endX="180" startY="210" marked="false" color="255" endY="285" startX="120" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="120"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+      <line endX="270" startY="120" marked="false" color="255" endY="120" startX="30"></line>
+    </shape>
+    <shape name="leaf" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="210"></point>
+        <point x="135" y="195"></point>
+        <point x="120" y="210"></point>
+        <point x="60" y="210"></point>
+        <point x="30" y="195"></point>
+        <point x="60" y="180"></point>
+        <point x="60" y="165"></point>
+        <point x="15" y="135"></point>
+        <point x="30" y="120"></point>
+        <point x="15" y="105"></point>
+        <point x="40" y="104"></point>
+        <point x="45" y="90"></point>
+        <point x="60" y="90"></point>
+        <point x="90" y="105"></point>
+        <point x="105" y="120"></point>
+        <point x="120" y="120"></point>
+        <point x="105" y="60"></point>
+        <point x="120" y="60"></point>
+        <point x="135" y="30"></point>
+        <point x="150" y="15"></point>
+        <point x="165" y="30"></point>
+        <point x="180" y="60"></point>
+        <point x="195" y="60"></point>
+        <point x="180" y="120"></point>
+        <point x="195" y="120"></point>
+        <point x="210" y="105"></point>
+        <point x="240" y="90"></point>
+        <point x="255" y="90"></point>
+        <point x="263" y="104"></point>
+        <point x="285" y="105"></point>
+        <point x="270" y="120"></point>
+        <point x="285" y="135"></point>
+        <point x="240" y="165"></point>
+        <point x="240" y="180"></point>
+        <point x="270" y="195"></point>
+        <point x="240" y="210"></point>
+        <point x="180" y="210"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="195"></point>
+        <point x="135" y="240"></point>
+        <point x="120" y="255"></point>
+        <point x="105" y="255"></point>
+        <point x="105" y="285"></point>
+        <point x="135" y="285"></point>
+        <point x="165" y="240"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+    </shape>
+    <shape name="line" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="300" startX="150"></line>
+    </shape>
+    <shape name="line half" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="150" startX="150"></line>
+    </shape>
+    <shape name="pentagon" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="15"></point>
+        <point x="15" y="120"></point>
+        <point x="60" y="285"></point>
+        <point x="240" y="285"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+    </shape>
+    <shape name="person" rotatable="false" editableColorIndex="0">
+      <circle x="110" y="5" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="120" y="195"></point>
+        <point x="90" y="285"></point>
+        <point x="105" y="300"></point>
+        <point x="135" y="300"></point>
+        <point x="150" y="225"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="300"></point>
+        <point x="210" y="285"></point>
+        <point x="180" y="195"></point>
+        <point x="195" y="90"></point>
+      </polygon>
+      <rectangle endX="172" startY="79" marked="true" color="-1920102913" endY="94" startX="127" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="195" y="90"></point>
+        <point x="240" y="150"></point>
+        <point x="225" y="180"></point>
+        <point x="165" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="60" y="150"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="105"></point>
+      </polygon>
+    </shape>
+    <shape name="plant" rotatable="false" editableColorIndex="0">
+      <rectangle endX="165" startY="90" marked="true" color="-1920102913" endY="300" startX="135" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="255"></point>
+        <point x="90" y="210"></point>
+        <point x="45" y="195"></point>
+        <point x="75" y="255"></point>
+        <point x="135" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="255"></point>
+        <point x="210" y="210"></point>
+        <point x="255" y="195"></point>
+        <point x="225" y="255"></point>
+        <point x="165" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="180"></point>
+        <point x="90" y="135"></point>
+        <point x="45" y="120"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="180"></point>
+        <point x="165" y="210"></point>
+        <point x="225" y="180"></point>
+        <point x="255" y="120"></point>
+        <point x="210" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="105"></point>
+        <point x="90" y="60"></point>
+        <point x="45" y="45"></point>
+        <point x="75" y="105"></point>
+        <point x="135" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="105"></point>
+        <point x="165" y="135"></point>
+        <point x="225" y="105"></point>
+        <point x="255" y="45"></point>
+        <point x="210" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="90"></point>
+        <point x="120" y="45"></point>
+        <point x="150" y="15"></point>
+        <point x="180" y="45"></point>
+        <point x="165" y="90"></point>
+      </polygon>
+    </shape>
+    <shape name="sheep" rotatable="false" editableColorIndex="15">
+      <circle x="203" y="65" marked="true" color="-1" diameter="88" filled="true"></circle>
+      <circle x="70" y="65" marked="true" color="-1" diameter="162" filled="true"></circle>
+      <circle x="150" y="105" marked="true" color="-1" diameter="120" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="218" y="120"></point>
+        <point x="240" y="165"></point>
+        <point x="255" y="165"></point>
+        <point x="278" y="120"></point>
+      </polygon>
+      <circle x="214" y="72" marked="false" color="-1920102913" diameter="67" filled="true"></circle>
+      <rectangle endX="179" startY="223" marked="true" color="-1" endY="298" startX="164" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="45" y="285"></point>
+        <point x="30" y="285"></point>
+        <point x="30" y="240"></point>
+        <point x="15" y="195"></point>
+        <point x="45" y="210"></point>
+      </polygon>
+      <circle x="3" y="83" marked="true" color="-1" diameter="150" filled="true"></circle>
+      <rectangle endX="80" startY="221" marked="true" color="-1" endY="296" startX="65" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="195" y="285"></point>
+        <point x="210" y="285"></point>
+        <point x="210" y="240"></point>
+        <point x="240" y="210"></point>
+        <point x="195" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="276" y="85"></point>
+        <point x="285" y="105"></point>
+        <point x="302" y="99"></point>
+        <point x="294" y="83"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="219" y="85"></point>
+        <point x="210" y="105"></point>
+        <point x="193" y="99"></point>
+        <point x="201" y="83"></point>
+      </polygon>
+    </shape>
+    <shape name="square" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+    </shape>
+    <shape name="square 2" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+      <rectangle endX="240" startY="60" marked="false" color="255" endY="240" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="star" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="151" y="1"></point>
+        <point x="185" y="108"></point>
+        <point x="298" y="108"></point>
+        <point x="207" y="175"></point>
+        <point x="242" y="282"></point>
+        <point x="151" y="216"></point>
+        <point x="59" y="282"></point>
+        <point x="94" y="175"></point>
+        <point x="3" y="108"></point>
+        <point x="116" y="108"></point>
+      </polygon>
+    </shape>
+    <shape name="target" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <circle x="60" y="60" marked="true" color="-1920102913" diameter="180" filled="true"></circle>
+      <circle x="90" y="90" marked="false" color="255" diameter="120" filled="true"></circle>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+    </shape>
+    <shape name="tree" rotatable="false" editableColorIndex="0">
+      <circle x="118" y="3" marked="true" color="-1920102913" diameter="94" filled="true"></circle>
+      <rectangle endX="180" startY="195" marked="false" color="-1653716737" endY="300" startX="120" filled="true"></rectangle>
+      <circle x="65" y="21" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="116" y="41" marked="true" color="-1920102913" diameter="127" filled="true"></circle>
+      <circle x="45" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+      <circle x="104" y="74" marked="true" color="-1920102913" diameter="152" filled="true"></circle>
+    </shape>
+    <shape name="triangle" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+    </shape>
+    <shape name="triangle 2" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="151" y="99"></point>
+        <point x="225" y="223"></point>
+        <point x="75" y="224"></point>
+      </polygon>
+    </shape>
+    <shape name="truck" rotatable="false" editableColorIndex="0">
+      <rectangle endX="195" startY="45" marked="true" color="-1920102913" endY="187" startX="4" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="296" y="193"></point>
+        <point x="296" y="150"></point>
+        <point x="259" y="134"></point>
+        <point x="244" y="104"></point>
+        <point x="208" y="104"></point>
+        <point x="207" y="194"></point>
+      </polygon>
+      <rectangle endX="195" startY="60" marked="false" color="-1" endY="105" startX="195" filled="true"></rectangle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="238" y="112"></point>
+        <point x="252" y="141"></point>
+        <point x="219" y="141"></point>
+        <point x="218" y="112"></point>
+      </polygon>
+      <circle x="234" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <rectangle endX="214" startY="185" marked="true" color="-1920102913" endY="194" startX="181" filled="true"></rectangle>
+      <circle x="144" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="144" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="234" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+    </shape>
+    <shape name="turtle" rotatable="true" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="215" y="204"></point>
+        <point x="240" y="233"></point>
+        <point x="246" y="254"></point>
+        <point x="228" y="266"></point>
+        <point x="215" y="252"></point>
+        <point x="193" y="210"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="195" y="90"></point>
+        <point x="225" y="75"></point>
+        <point x="245" y="75"></point>
+        <point x="260" y="89"></point>
+        <point x="269" y="108"></point>
+        <point x="261" y="124"></point>
+        <point x="240" y="105"></point>
+        <point x="225" y="105"></point>
+        <point x="210" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="105" y="90"></point>
+        <point x="75" y="75"></point>
+        <point x="55" y="75"></point>
+        <point x="40" y="89"></point>
+        <point x="31" y="108"></point>
+        <point x="39" y="124"></point>
+        <point x="60" y="105"></point>
+        <point x="75" y="105"></point>
+        <point x="90" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="132" y="85"></point>
+        <point x="134" y="64"></point>
+        <point x="107" y="51"></point>
+        <point x="108" y="17"></point>
+        <point x="150" y="2"></point>
+        <point x="192" y="18"></point>
+        <point x="192" y="52"></point>
+        <point x="169" y="65"></point>
+        <point x="172" y="87"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="85" y="204"></point>
+        <point x="60" y="233"></point>
+        <point x="54" y="254"></point>
+        <point x="72" y="266"></point>
+        <point x="85" y="252"></point>
+        <point x="107" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="119" y="75"></point>
+        <point x="179" y="75"></point>
+        <point x="209" y="101"></point>
+        <point x="224" y="135"></point>
+        <point x="220" y="225"></point>
+        <point x="175" y="261"></point>
+        <point x="128" y="261"></point>
+        <point x="81" y="224"></point>
+        <point x="74" y="135"></point>
+        <point x="88" y="99"></point>
+      </polygon>
+    </shape>
+    <shape name="wheel" rotatable="false" editableColorIndex="0">
+      <circle x="3" y="3" marked="true" color="-1920102913" diameter="294" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <line endX="150" startY="285" marked="true" color="-1920102913" endY="15" startX="150"></line>
+      <line endX="285" startY="150" marked="true" color="-1920102913" endY="150" startX="15"></line>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+      <line endX="79" startY="40" marked="true" color="-1920102913" endY="269" startX="216"></line>
+      <line endX="269" startY="84" marked="true" color="-1920102913" endY="221" startX="40"></line>
+      <line endX="269" startY="216" marked="true" color="-1920102913" endY="79" startX="40"></line>
+      <line endX="221" startY="40" marked="true" color="-1920102913" endY="269" startX="84"></line>
+    </shape>
+    <shape name="wolf" rotatable="false" editableColorIndex="0">
+      <polygon color="255" filled="true" marked="false">
+        <point x="253" y="133"></point>
+        <point x="245" y="131"></point>
+        <point x="245" y="133"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="2" y="194"></point>
+        <point x="13" y="197"></point>
+        <point x="30" y="191"></point>
+        <point x="38" y="193"></point>
+        <point x="38" y="205"></point>
+        <point x="20" y="226"></point>
+        <point x="20" y="257"></point>
+        <point x="27" y="265"></point>
+        <point x="38" y="266"></point>
+        <point x="40" y="260"></point>
+        <point x="31" y="253"></point>
+        <point x="31" y="230"></point>
+        <point x="60" y="206"></point>
+        <point x="68" y="198"></point>
+        <point x="75" y="209"></point>
+        <point x="66" y="228"></point>
+        <point x="65" y="243"></point>
+        <point x="82" y="261"></point>
+        <point x="84" y="268"></point>
+        <point x="100" y="267"></point>
+        <point x="103" y="261"></point>
+        <point x="77" y="239"></point>
+        <point x="79" y="231"></point>
+        <point x="100" y="207"></point>
+        <point x="98" y="196"></point>
+        <point x="119" y="201"></point>
+        <point x="143" y="202"></point>
+        <point x="160" y="195"></point>
+        <point x="166" y="210"></point>
+        <point x="172" y="213"></point>
+        <point x="173" y="238"></point>
+        <point x="167" y="251"></point>
+        <point x="160" y="248"></point>
+        <point x="154" y="265"></point>
+        <point x="169" y="264"></point>
+        <point x="178" y="247"></point>
+        <point x="186" y="240"></point>
+        <point x="198" y="260"></point>
+        <point x="200" y="271"></point>
+        <point x="217" y="271"></point>
+        <point x="219" y="262"></point>
+        <point x="207" y="258"></point>
+        <point x="195" y="230"></point>
+        <point x="192" y="198"></point>
+        <point x="210" y="184"></point>
+        <point x="227" y="164"></point>
+        <point x="242" y="144"></point>
+        <point x="259" y="145"></point>
+        <point x="284" y="151"></point>
+        <point x="277" y="141"></point>
+        <point x="293" y="140"></point>
+        <point x="299" y="134"></point>
+        <point x="297" y="127"></point>
+        <point x="273" y="119"></point>
+        <point x="270" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="-1" y="195"></point>
+        <point x="14" y="180"></point>
+        <point x="36" y="166"></point>
+        <point x="40" y="153"></point>
+        <point x="53" y="140"></point>
+        <point x="82" y="131"></point>
+        <point x="134" y="133"></point>
+        <point x="159" y="126"></point>
+        <point x="188" y="115"></point>
+        <point x="227" y="108"></point>
+        <point x="236" y="102"></point>
+        <point x="238" y="98"></point>
+        <point x="268" y="86"></point>
+        <point x="269" y="92"></point>
+        <point x="281" y="87"></point>
+        <point x="269" y="103"></point>
+        <point x="269" y="113"></point>
+      </polygon>
+    </shape>
+    <shape name="x" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="270" y="75"></point>
+        <point x="225" y="30"></point>
+        <point x="30" y="225"></point>
+        <point x="75" y="270"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="75"></point>
+        <point x="75" y="30"></point>
+        <point x="270" y="225"></point>
+        <point x="225" y="270"></point>
+      </polygon>
+    </shape>
+  </turtleShapes>
+  <linkShapes>
+    <shape name="default" curviness="0.0">
+      <lines>
+        <line x="-0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+        <line x="0.0" visible="true">
+          <dash value="1.0"></dash>
+          <dash value="0.0"></dash>
+        </line>
+        <line x="0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+      </lines>
+      <indicator>
+        <shape name="link direction" rotatable="true" editableColorIndex="0">
+          <line endX="90" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+          <line endX="210" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+        </shape>
+      </indicator>
+    </shape>
+  </linkShapes>
+  <previewCommands>setup repeat 75 [ go ]</previewCommands>
+</model>
